@@ -636,6 +636,7 @@ class TempMailService(BaseEmailService):
             "enablePrefix": enable_prefix,
             "name": name,
             "domain": domain,
+            "enableRandomSubdomain": True
         }
 
         try:

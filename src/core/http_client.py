@@ -282,9 +282,6 @@ class OpenAIHTTPClient(HTTPClient):
             loc_match = re.search(r"loc=([A-Z]+)", trace_text)
             loc = loc_match.group(1) if loc_match else None
 
-            # 检查是否支持
-            if loc in ["CN", "HK", "MO", "TW"]:
-                return False, loc
             return True, loc
 
         except Exception as e:
