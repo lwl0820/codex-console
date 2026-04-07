@@ -84,12 +84,13 @@ function sleep(ms) {
 async function watchOverviewTask(taskId, onUpdate, maxWaitMs = 20 * 60 * 1000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < maxWaitMs) {
-        const task = await api.get(`/accounts/tasks/${taskId}`, {
+        const response = await api.get(`/tasks/accounts/${taskId}`, {
             requestKey: `overview:task:${taskId}`,
             cancelPrevious: true,
             retry: 0,
             timeoutMs: 30000,
         });
+        const task = response?.task || response;
 
         if (typeof onUpdate === 'function') {
             onUpdate(task);

@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import threading
+import uuid
 import zipfile
 import base64
 from datetime import datetime, timedelta, timezone
@@ -128,6 +129,447 @@ def has_active_batch_operations() -> bool:
             if status in busy_statuses:
                 return True
     return False
+
+
+ACCOUNT_TASK_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def _build_account_task_payload(request: Any) -> Dict[str, Any]:
+    return request.model_dump() if hasattr(request, "model_dump") else dict(request or {})
+
+
+def _account_task_snapshot_or_404(task_id: str) -> Dict[str, Any]:
+    snapshot = task_manager.get_domain_task("accounts", task_id)
+    if not snapshot:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return snapshot
+
+
+def _account_task_result_summary(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return "任务执行完成"
+    if "success_count" in result or "failed_count" in result:
+        return f"任务执行完成：成功 {int(result.get('success_count') or 0)}，失败 {int(result.get('failed_count') or 0)}"
+    if "valid_count" in result or "invalid_count" in result:
+        return f"任务执行完成：有效 {int(result.get('valid_count') or 0)}，无效 {int(result.get('invalid_count') or 0)}"
+    return "任务执行完成"
+
+
+def _wait_if_account_task_paused(task_id: str) -> bool:
+    while True:
+        snapshot = task_manager.get_domain_task("accounts", task_id) or {}
+        status = str(snapshot.get("status") or "").strip().lower()
+        if status != "paused" and not bool(snapshot.get("pause_requested")):
+            return bool(task_manager.is_domain_task_cancel_requested("accounts", task_id))
+        if task_manager.is_domain_task_cancel_requested("accounts", task_id):
+            return True
+        task_manager.update_domain_task(
+            "accounts",
+            task_id,
+            status="paused",
+            paused=True,
+            message="任务已暂停，等待继续",
+        )
+        threading.Event().wait(0.35)
+
+
+def _run_account_domain_task(
+    *,
+    task_id: str,
+    task_type: str,
+    ids: List[int],
+    worker,
+    summary_builder=None,
+) -> None:
+    acquired, running, quota = task_manager.try_acquire_domain_slot("accounts", task_id)
+    if not acquired:
+        reason = f"并发配额已满（running={running}, quota={quota}）"
+        task_manager.update_domain_task(
+            "accounts",
+            task_id,
+            status="failed",
+            finished_at=datetime.utcnow().isoformat(),
+            message=reason,
+            error=reason,
+        )
+        return
+
+    total = len(ids)
+    task_manager.update_domain_task(
+        "accounts",
+        task_id,
+        task_type=task_type,
+        status="running",
+        started_at=datetime.utcnow().isoformat(),
+        paused=False,
+        pause_requested=False,
+        progress={"completed": 0, "total": total},
+        message="任务执行中",
+    )
+
+    details: List[Dict[str, Any]] = []
+    try:
+        for index, account_id in enumerate(ids, start=1):
+            if task_manager.is_domain_task_cancel_requested("accounts", task_id):
+                result = summary_builder(details, cancelled=True) if callable(summary_builder) else {"details": details}
+                task_manager.update_domain_task(
+                    "accounts",
+                    task_id,
+                    status="cancelled",
+                    finished_at=datetime.utcnow().isoformat(),
+                    message="任务已取消",
+                    result=result,
+                    progress={"completed": max(0, index - 1), "total": total},
+                    details=details,
+                )
+                return
+
+            if _wait_if_account_task_paused(task_id):
+                result = summary_builder(details, cancelled=True) if callable(summary_builder) else {"details": details}
+                task_manager.update_domain_task(
+                    "accounts",
+                    task_id,
+                    status="cancelled",
+                    finished_at=datetime.utcnow().isoformat(),
+                    message="任务已取消",
+                    result=result,
+                    progress={"completed": max(0, index - 1), "total": total},
+                    details=details,
+                )
+                return
+
+            detail = worker(account_id)
+            details.append(detail)
+            task_manager.update_domain_task(
+                "accounts",
+                task_id,
+                progress={"completed": index, "total": total},
+                details=details,
+                message=f"任务执行中 {index}/{total}",
+            )
+
+        result = summary_builder(details, cancelled=False) if callable(summary_builder) else {"details": details}
+        task_manager.update_domain_task(
+            "accounts",
+            task_id,
+            status="completed",
+            finished_at=datetime.utcnow().isoformat(),
+            message=_account_task_result_summary(result),
+            result=result,
+            progress={"completed": total, "total": total},
+            details=details,
+            paused=False,
+            pause_requested=False,
+        )
+    except Exception as exc:
+        logger.exception("账户域异步任务执行失败: task_id=%s type=%s error=%s", task_id, task_type, exc)
+        task_manager.update_domain_task(
+            "accounts",
+            task_id,
+            status="failed",
+            finished_at=datetime.utcnow().isoformat(),
+            message=f"任务异常: {exc}",
+            error=str(exc),
+            progress={"completed": len(details), "total": total},
+            details=details,
+        )
+    finally:
+        task_manager.release_domain_slot("accounts", task_id)
+
+
+def _build_batch_refresh_detail(account_id: int, proxy: Optional[str]) -> Dict[str, Any]:
+    try:
+        result = do_refresh(account_id, proxy)
+        if result.success:
+            return {
+                "id": account_id,
+                "success": True,
+                "expires_at": result.expires_at.isoformat() if result.expires_at else None,
+                "error": None,
+            }
+        return {
+            "id": account_id,
+            "success": False,
+            "expires_at": None,
+            "error": result.error_message,
+        }
+    except Exception as exc:
+        return {"id": account_id, "success": False, "expires_at": None, "error": str(exc)}
+
+
+def _summarize_batch_refresh(details: List[Dict[str, Any]], cancelled: bool = False) -> Dict[str, Any]:
+    success_count = sum(1 for item in details if item.get("success"))
+    failed_count = max(0, len(details) - success_count)
+    return {
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "details": details,
+        "cancelled": bool(cancelled),
+    }
+
+
+def _start_account_batch_refresh_task(request: "BatchRefreshRequest") -> Dict[str, Any]:
+    with get_db() as db:
+        ids = resolve_account_ids(
+            db,
+            request.ids,
+            request.select_all,
+            request.status_filter,
+            request.email_service_filter,
+            request.search_filter,
+        )
+
+    task_id = f"accounts-refresh-{uuid.uuid4().hex[:12]}"
+    task = task_manager.register_domain_task(
+        domain="accounts",
+        task_id=task_id,
+        task_type="batch_refresh",
+        payload=_build_account_task_payload(request),
+        progress={"completed": 0, "total": len(ids)},
+        max_retries=1,
+    )
+    proxy = _get_proxy(request.proxy)
+    task_manager.executor.submit(
+        _run_account_domain_task,
+        task_id=task_id,
+        task_type="batch_refresh",
+        ids=ids,
+        worker=lambda account_id: _build_batch_refresh_detail(account_id, proxy),
+        summary_builder=_summarize_batch_refresh,
+    )
+    return task
+
+
+def _build_batch_validate_detail(account_id: int, proxy: Optional[str]) -> Dict[str, Any]:
+    try:
+        is_valid, error = do_validate(account_id, proxy)
+        with get_db() as db:
+            account = crud.get_account_by_id(db, account_id)
+            status = str(getattr(account, "status", "") or "").strip().lower() if account else ""
+        return {
+            "id": account_id,
+            "valid": bool(is_valid),
+            "error": error,
+            "status": status,
+        }
+    except Exception as exc:
+        try:
+            with get_db() as db:
+                account = crud.get_account_by_id(db, account_id)
+                if account and account.status != AccountStatus.FAILED.value:
+                    crud.update_account(db, account_id, status=AccountStatus.FAILED.value)
+        except Exception:
+            pass
+        return {
+            "id": account_id,
+            "valid": False,
+            "error": str(exc),
+            "status": AccountStatus.FAILED.value,
+        }
+
+
+def _summarize_batch_validate(details: List[Dict[str, Any]], cancelled: bool = False) -> Dict[str, Any]:
+    valid_count = sum(1 for item in details if item.get("valid"))
+    invalid_count = max(0, len(details) - valid_count)
+    return {
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
+        "details": details,
+        "cancelled": bool(cancelled),
+    }
+
+
+def _start_account_batch_validate_task(request: "BatchValidateRequest") -> Dict[str, Any]:
+    with get_db() as db:
+        ids = resolve_account_ids(
+            db,
+            request.ids,
+            request.select_all,
+            request.status_filter,
+            request.email_service_filter,
+            request.search_filter,
+        )
+
+    task_id = f"accounts-validate-{uuid.uuid4().hex[:12]}"
+    task = task_manager.register_domain_task(
+        domain="accounts",
+        task_id=task_id,
+        task_type="batch_validate",
+        payload=_build_account_task_payload(request),
+        progress={"completed": 0, "total": len(ids)},
+        max_retries=1,
+    )
+    proxy = _get_proxy(request.proxy)
+    task_manager.executor.submit(
+        _run_account_domain_task,
+        task_id=task_id,
+        task_type="batch_validate",
+        ids=ids,
+        worker=lambda account_id: _build_batch_validate_detail(account_id, proxy),
+        summary_builder=_summarize_batch_validate,
+    )
+    return task
+
+
+def _build_overview_refresh_detail(account_id: int, request: "OverviewRefreshRequest") -> Dict[str, Any]:
+    proxy = _get_proxy(request.proxy)
+    with get_db() as db:
+        account = crud.get_account_by_id(db, account_id)
+        if not account:
+            logger.warning("账号总览刷新失败: account_id=%s error=账号不存在", account_id)
+            return {"id": account_id, "success": False, "error": "账号不存在"}
+        if (not _is_paid_subscription(account.subscription_type)) or _is_overview_card_removed(account):
+            return {
+                "id": account.id,
+                "email": account.email,
+                "success": False,
+                "error": "账号不在 Codex 卡片范围内，已跳过",
+            }
+
+        account_proxy = (account.proxy_used or "").strip() or proxy
+        overview, updated = _get_account_overview_data(
+            db,
+            account,
+            force_refresh=request.force,
+            proxy=account_proxy,
+            allow_network=True,
+        )
+        if updated:
+            db.commit()
+
+        if overview.get("hourly_quota", {}).get("status") == "unknown" and overview.get("weekly_quota", {}).get("status") == "unknown":
+            logger.warning(
+                "账号总览刷新失败: account_id=%s email=%s error=%s",
+                account.id,
+                account.email,
+                overview.get("error") or "未获取到配额数据",
+            )
+            return {
+                "id": account.id,
+                "email": account.email,
+                "success": False,
+                "error": overview.get("error") or "未获取到配额数据",
+            }
+
+        logger.info(
+            "账号总览刷新成功: account_id=%s email=%s plan=%s hourly=%s weekly=%s code_review=%s hourly_source=%s weekly_source=%s",
+            account.id,
+            account.email,
+            overview.get("plan_type") or "-",
+            overview.get("hourly_quota", {}).get("percentage"),
+            overview.get("weekly_quota", {}).get("percentage"),
+            overview.get("code_review_quota", {}).get("percentage"),
+            overview.get("hourly_quota", {}).get("source"),
+            overview.get("weekly_quota", {}).get("source"),
+        )
+        return {
+            "id": account.id,
+            "email": account.email,
+            "success": True,
+            "plan_type": overview.get("plan_type"),
+        }
+
+
+def _summarize_overview_refresh(details: List[Dict[str, Any]], cancelled: bool = False) -> Dict[str, Any]:
+    success_count = sum(1 for item in details if item.get("success"))
+    failed_count = max(0, len(details) - success_count)
+    return {
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "details": details,
+        "cancelled": bool(cancelled),
+    }
+
+
+def _start_overview_refresh_task(request: "OverviewRefreshRequest") -> Dict[str, Any]:
+    with get_db() as db:
+        ids = resolve_account_ids(
+            db,
+            request.ids,
+            request.select_all,
+            request.status_filter,
+            request.email_service_filter,
+            request.search_filter,
+        )
+        if not ids:
+            candidates = db.query(Account).filter(
+                func.lower(Account.subscription_type).in_(PAID_SUBSCRIPTION_TYPES)
+            ).order_by(Account.created_at.desc()).all()
+            ids = [acc.id for acc in candidates if not _is_overview_card_removed(acc)]
+
+    logger.info(
+        "账号总览异步刷新任务创建: target_count=%s force=%s select_all=%s",
+        len(ids),
+        bool(request.force),
+        bool(request.select_all),
+    )
+    task_id = f"accounts-overview-{uuid.uuid4().hex[:12]}"
+    task = task_manager.register_domain_task(
+        domain="accounts",
+        task_id=task_id,
+        task_type="overview_refresh",
+        payload=_build_account_task_payload(request),
+        progress={"completed": 0, "total": len(ids)},
+        max_retries=1,
+    )
+    task_manager.executor.submit(
+        _run_account_domain_task,
+        task_id=task_id,
+        task_type="overview_refresh",
+        ids=ids,
+        worker=lambda account_id: _build_overview_refresh_detail(account_id, request),
+        summary_builder=_summarize_overview_refresh,
+    )
+    return task
+
+
+@router.get("/tasks/{task_id}")
+def get_account_async_task(task_id: str):
+    return _account_task_snapshot_or_404(task_id)
+
+
+def cancel_account_async_task(task_id: str) -> Dict[str, Any]:
+    snapshot = _account_task_snapshot_or_404(task_id)
+    status = str(snapshot.get("status") or "").strip().lower()
+    if status in ACCOUNT_TASK_TERMINAL_STATUSES:
+        return {"success": True, "task_id": task_id, "status": status, "task": snapshot}
+    task = task_manager.request_domain_task_cancel("accounts", task_id)
+    return {"success": True, "task_id": task_id, "status": "cancelling", "task": task}
+
+
+def pause_account_async_task(task_id: str) -> Dict[str, Any]:
+    _account_task_snapshot_or_404(task_id)
+    task = task_manager.request_domain_task_pause("accounts", task_id)
+    return {"success": True, "task_id": task_id, "status": str(task.get("status") or "paused"), "task": task}
+
+
+def resume_account_async_task(task_id: str) -> Dict[str, Any]:
+    _account_task_snapshot_or_404(task_id)
+    task = task_manager.request_domain_task_resume("accounts", task_id)
+    return {"success": True, "task_id": task_id, "status": str(task.get("status") or "running"), "task": task}
+
+
+def retry_account_async_task(task_id: str) -> Dict[str, Any]:
+    snapshot = _account_task_snapshot_or_404(task_id)
+    payload = dict(snapshot.get("payload") or {})
+    task_type = str(snapshot.get("task_type") or "").strip().lower()
+
+    if task_type == "batch_refresh":
+        task = _start_account_batch_refresh_task(BatchRefreshRequest(**payload))
+    elif task_type == "batch_validate":
+        task = _start_account_batch_validate_task(BatchValidateRequest(**payload))
+    elif task_type == "overview_refresh":
+        task = _start_overview_refresh_task(OverviewRefreshRequest(**payload))
+    else:
+        raise HTTPException(status_code=400, detail="该任务类型暂不支持重试")
+
+    task_manager.request_domain_task_retry("accounts", task_id)
+    return {
+        "success": True,
+        "message": "已创建新的重试任务",
+        "retry_from": task_id,
+        "task": task,
+    }
 
 
 # ============== Pydantic Models ==============
@@ -1340,6 +1782,12 @@ async def refresh_accounts_overview(request: OverviewRefreshRequest):
     return result
 
 
+@router.post("/overview/refresh/async")
+async def refresh_accounts_overview_async(request: OverviewRefreshRequest):
+    """异步刷新账号总览数据。"""
+    return _start_overview_refresh_task(request)
+
+
 @router.get("/current")
 async def get_current_account():
     """获取当前已切换的账号"""
@@ -1948,6 +2396,12 @@ async def batch_refresh_tokens(request: BatchRefreshRequest, background_tasks: B
     return results
 
 
+@router.post("/batch-refresh/async")
+async def batch_refresh_tokens_async(request: BatchRefreshRequest):
+    """异步批量刷新账号 Token。"""
+    return _start_account_batch_refresh_task(request)
+
+
 @router.post("/{account_id}/refresh")
 async def refresh_account_token(account_id: int, request: Optional[TokenRefreshRequest] = Body(default=None)):
     """刷新单个账号的 Token"""
@@ -2018,6 +2472,12 @@ def _run_batch_validate_tokens(request: BatchValidateRequest) -> Dict[str, Any]:
 async def batch_validate_tokens(request: BatchValidateRequest):
     """批量验证账号 Token 有效性"""
     return _run_batch_validate_tokens(request)
+
+
+@router.post("/batch-validate/async")
+async def batch_validate_tokens_async(request: BatchValidateRequest):
+    """异步批量验证账号 Token 有效性。"""
+    return _start_account_batch_validate_task(request)
 
 
 def run_quick_refresh_workflow(source: str = "manual") -> Dict[str, Any]:

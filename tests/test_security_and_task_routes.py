@@ -28,6 +28,16 @@ def test_api_accounts_route_has_auth_dependency():
     assert require_api_auth in dependency_calls
 
 
+def test_async_account_and_payment_routes_are_registered():
+    app = create_app()
+    _find_route(app, "/api/accounts/batch-refresh/async", "POST")
+    _find_route(app, "/api/accounts/batch-validate/async", "POST")
+    _find_route(app, "/api/accounts/overview/refresh/async", "POST")
+    _find_route(app, "/api/accounts/tasks/{task_id}", "GET")
+    _find_route(app, "/api/payment/accounts/batch-check-subscription/async", "POST")
+    _find_route(app, "/api/payment/ops/tasks/{task_id}", "GET")
+
+
 def test_unified_tasks_router_exposes_summary_and_cancel():
     paths = {route.path for route in tasks_routes.router.routes if hasattr(route, "path")}
     assert "/summary" in paths

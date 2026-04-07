@@ -114,15 +114,18 @@ async function watchDomainTask(fetchTask, onUpdate, maxWaitMs = 20 * 60 * 1000, 
 
 async function watchAccountTask(taskId, onUpdate, maxWaitMs = 20 * 60 * 1000) {
     return watchDomainTask(
-        () => api.get(`/accounts/tasks/${taskId}`, {
-            requestKey: `accounts:task:${taskId}`,
-            cancelPrevious: true,
-            retry: 0,
-            timeoutMs: 30000,
-            silentNetworkError: true,
-            silentTimeoutError: true,
-            priority: 'low',
-        }),
+        async () => {
+            const response = await api.get(`/tasks/accounts/${taskId}`, {
+                requestKey: `accounts:task:${taskId}`,
+                cancelPrevious: true,
+                retry: 0,
+                timeoutMs: 30000,
+                silentNetworkError: true,
+                silentTimeoutError: true,
+                priority: 'low',
+            });
+            return response?.task || response;
+        },
         onUpdate,
         maxWaitMs,
         { baseIntervalMs: 1200, maxIntervalMs: 12000 },
@@ -131,15 +134,18 @@ async function watchAccountTask(taskId, onUpdate, maxWaitMs = 20 * 60 * 1000) {
 
 async function watchPaymentTask(taskId, onUpdate, maxWaitMs = 20 * 60 * 1000) {
     return watchDomainTask(
-        () => api.get(`/payment/ops/tasks/${taskId}`, {
-            requestKey: `payment:task:${taskId}`,
-            cancelPrevious: true,
-            retry: 0,
-            timeoutMs: 30000,
-            silentNetworkError: true,
-            silentTimeoutError: true,
-            priority: 'low',
-        }),
+        async () => {
+            const response = await api.get(`/tasks/payment/${taskId}`, {
+                requestKey: `payment:task:${taskId}`,
+                cancelPrevious: true,
+                retry: 0,
+                timeoutMs: 30000,
+                silentNetworkError: true,
+                silentTimeoutError: true,
+                priority: 'low',
+            });
+            return response?.task || response;
+        },
         onUpdate,
         maxWaitMs,
         { baseIntervalMs: 1200, maxIntervalMs: 12000 },

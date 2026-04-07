@@ -143,12 +143,13 @@ function sleep(ms) {
 async function watchPaymentOpTask(taskId, onUpdate, maxWaitMs = 20 * 60 * 1000) {
     const startedAt = Date.now();
     while (Date.now() - startedAt < maxWaitMs) {
-        const task = await api.get(`/payment/ops/tasks/${taskId}`, {
+        const response = await api.get(`/tasks/payment/${taskId}`, {
             timeoutMs: 30000,
             retry: 0,
             requestKey: `payment:op-task:${taskId}`,
             cancelPrevious: true,
         });
+        const task = response?.task || response;
 
         if (typeof onUpdate === "function") {
             onUpdate(task);
